@@ -8,7 +8,8 @@ This dataset has been cleaned and filtered to only include auctions from 2006 an
 library(dplyr)
 library(readr)
 auctions <- read.csv("df_for_ml_improved_up_to_2012.csv")
-transactions <- read.csv("transactions.csv")
+#transactions <- read.csv("transactions.csv") #charlie path
+transactions <- read.csv("/Users/tiernancolby/Downloads/transactions.csv") # Tiernan path
 
 auctions <- auctions |>
     left_join(transactions, by = "case_id") |>
@@ -388,7 +389,7 @@ message("Wrote ", nrow(clean), " rows x ", ncol(clean), " columns to ", file.pat
 ```{r}
 library(ggplot2)
 
-ggplot(auctions, aes(x = factor(year), y = price_usd.x)) +
+ggplot(clean, aes(x = factor(year_made), y = price_usd)) +
     geom_boxplot() +
     scale_y_log10()+
     labs(title = "Boxplot of Price by Year", x = "Year", y = "Auction Price (log scale)")
@@ -399,3 +400,59 @@ ggplot(auctions, aes(x = factor(year), y = price_usd.x)) +
 ggplot(auctions, aes(x = genre)) +
     geom_histogram(stat= count)
 ```
+
+
+### Inital model fitting
+
+```{r}
+library(MASS)
+```
+
+
+```{r}
+#plot(clean$log_price)
+#plot(clean$price_usd)
+
+
+# remove predictors 
+model_df <- clean |>
+  select(
+    -c(log_price, price_real_usd, log_price_real, price_adj_usd, log_price_adj),  # other transformations of the response
+    -price_local, -in_est_range, -matches("_ppsi$"), # variables that depend on the response
+    -starts_with("est_"), -log_est_mid, -log10_est_geomean, # estimates of the response from experts
+    -c(row_id, artist_id, lot_id, lot_no, sale_name, title, image_url, # id vars/not predictors
+       sale_country_raw, sale_currency, cpi, sale_date, artist) 
+  ) |>
+  mutate(across(c(house_tier, materials), as.factor))
+
+ols <- lm(price_usd ~ ., data = model_df)
+summary(ols)
+
+#transform y
+bc <- boxcox(ols, lambda = seq(-.1, 0, 0.05))
+lambda <- bc$x[which.max(bc$y)]
+lambda
+
+# refit ols with transformed response
+ols_y_trans <- lm(I(price_usd^(lambda)) ~ ., data = model_df)
+summary(ols_y_trans)
+```
+From the box cox transformation we use a lambda of $-0.06565657$, the center of the confidence interval, because neither $0$ nor $1$ are in the confidence interval.
+
+We see that the (almost) log transformation of the response increases the Multiple R-squared of the OLS model by almost $.3$. 
+
+We notice that many of the predictors have estimates of NA. This means that we have a lot of colinearity in the data. 
+
+Thus we think that the model assumptions are not met. We check the model assumptions
+
+```{r}
+plot(fitted(ols_y_trans), resid(ols_y_trans), xlab = "Fitted", ylab = "Residuals")
+abline(h = 0, col = "blue3")
+
+qqnorm(resid(ols_y_trans))
+qqline(resid(ols_y_trans), col = "blue3")
+
+```
+From the first plot it is hard to tell how much heterogenity we have, but certainly the variance of the first few residuals are a lot lower than the rest. From the second plots we see that the residuals are not normally distributed because they largely differ from the normal Q-Q plot.
+
+Because of the colinearty and model assumptions a linear model is probably not a good model here, so we will try other models such as lasso.  
