@@ -2,14 +2,17 @@
 title: "Data Cleaning + EDA"
 format: html
 ---
-This dataset has been cleaned and filtered to only include auctions from 2006 and later. The dataset includes information on auction prices, dates, and other relevant features. We also have a separate dataset containing transaction information, which we will join with the auction data for further analysis.
+
+
+# Data Cleaning and Exploratory Data Analysis
+This dataset has been filtered to only include auctions from 2006 and later. The dataset includes information on auction prices, dates, and other relevant features. We also have a separate dataset containing transaction information, which we will join with the auction data for further analysis.
 
 ```{r}
 library(dplyr)
 library(readr)
 auctions <- read.csv("df_for_ml_improved_up_to_2012.csv")
-#transactions <- read.csv("transactions.csv") #charlie path
-transactions <- read.csv("/Users/tiernancolby/Downloads/transactions.csv") # Tiernan path
+transactions <- read.csv("transactions.csv") #charlie path
+#transactions <- read.csv("/Users/tiernancolby/Downloads/transactions.csv") # Tiernan path
 
 auctions <- auctions |>
     left_join(transactions, by = "case_id") |>
@@ -19,390 +22,182 @@ write_csv(auctions, "joined_auctions_transactions.csv")
 ```
 
 
-The complete dataset, composed of the two joined tables, contains 24391 observations and 149 variables. 
+The complete dataset, composed of two joined tables, contains `r format(nrow(auctions), big.mark = ",")` observations and `r ncol(auctions)` variables before cleaning.
+
 ```{r}
-# Clean the joined auction dataset (Lee et al. 2024, figshare 10.6084/m9.figshare.24746268)
-#
-# Outputs (in out_dir):
-#   auctions_clean.csv   one cleaned table
-#   data_dictionary.md   what every column means
-#
-# Run in RStudio / a Quarto chunk (set the paths below), or from a terminal:
-#   Rscript clean_auctions.R joined_auctions_transactions.csv [out_dir]
+#| label: clean-auctions
+#| message: false
 
-suppressPackageStartupMessages(library(tidyverse))
+library(tidyverse)
 
-in_path <- "joined_auctions_transactions.csv"
-out_dir <- "."
+MAX_SIDE_IN <- 300  # a side longer than this (inches) is treated as a unit error
 
-args <- commandArgs(trailingOnly = TRUE)
-if (!interactive() && !isTRUE(getOption("knitr.in.progress")) && length(args) >= 1) {
-  in_path <- args[1]
-  if (length(args) >= 2) out_dir <- args[2]
-}
-dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+raw <- read_csv("joined_auctions_transactions.csv",
+                locale = locale(encoding = "latin1"),  # file is not UTF-8
+                name_repair = "minimal",               # keep names like Tier...1
+                guess_max = 30000, show_col_types = FALSE,
+                col_types = cols(Year.of.Birth = col_character()))
 
-# ---------------------------------------------------------------------------
-# Settings
-# ---------------------------------------------------------------------------
-MAX_SIDE_IN  <- 300    # sides above this are flagged as likely unit errors
-PREMIUM_RATE <- 0.20   # assumed buyer's premium added to hammer prices in price_adj_usd
+# --- Helpers -----------------------------------------------------------------
 
-# Genre codes inferred from known artists and lot titles (not documented by the authors)
-GENRE_LABELS <- c(`1` = "Painting", `2` = "Photograph", `3` = "Drawing",
-                  `4` = "Print", `5` = "Sculpture", `6` = "Other")
-
-# ---------------------------------------------------------------------------
-# Column spec: the single source of truth for names, order and documentation.
-#   name    final column name
-#   from    source column to rename (NA = computed below)
-#   section heading in the dictionary
-#   use     id | target | feature | estimate | LEAK | flag | info
-#   desc    meaning
-# ---------------------------------------------------------------------------
-spec <- tribble(
-  ~name, ~from, ~section, ~use, ~desc,
-  # IDs ----------------------------------------------------------------------
-  "row_id", "case_id", "Identifiers", "id", "Unique row ID (source `case_id`).",
-  "artist_id", "sales_id", "Identifiers", "id", "Artist ID, one value per artist (source `sales_id`, despite the name). Use for grouped CV or random effects.",
-  "lot_id", "lot_num", "Identifiers", "id", "Lot page ID on the source website (source `lot_num`).",
-  "lot_no", NA, "Identifiers", "info", "Lot number within the sale (from text like 'Lot 227').",
-  "is_train", "train", "Identifiers", "id", "Authors' split: 1 = train (sales 2006-2011), 0 = test (2011-2012). Time-based; don't reshuffle.",
-
-  # Sale ---------------------------------------------------------------------
-  "sale_date", NA, "Sale", "feature", "Auction date.",
-  "sale_year", "year", "Sale", "feature", "Auction year.",
-  "sale_month", NA, "Sale", "feature", "Auction month (1-12).",
-  "sale_name", "event.name", "Sale", "info", "Name of the auction event.",
-  "house", "auction_house", "Sale", "feature", "Auction house name.",
-  "house_tier", NA, "Sale", "feature", "Auction house tier, 1 (top: Christie's, Sotheby's, Phillips) to 4, by market dominance and reputation.",
-  "sale_country", NA, "Sale", "feature", "Country of sale, grouped (largest markets + 'Others').",
-  "sale_country_raw", "country", "Sale", "info", "Country of sale as recorded (ungrouped).",
-  "sale_continent", NA, "Sale", "feature", "Continent of sale.",
-  "sale_currency", "currency", "Sale", "info", "Currency of the sale.",
-  "is_hammer", NA, "Sale", "feature", "1 = recorded price is the hammer price (no buyer's premium); 0 = price includes premium.",
-
-  # Price (targets) ------------------------------------------------------------
-  "price_usd", "price_usd.x", "Price (targets)", "target", "Sale price, nominal USD. Mixes hammer and premium prices (see `is_hammer`).",
-  "log_price", NA, "Price (targets)", "target", "Natural log of `price_usd`. Recommended target.",
-  "price_real_usd", "real_price_usd", "Price (targets)", "target", "Sale price adjusted for inflation with `cpi`.",
-  "log_price_real", NA, "Price (targets)", "target", "Natural log of `price_real_usd` (replaces the source's rounded `ln_real_price`).",
-  "price_adj_usd", NA, "Price (targets)", "target", "`price_usd` with hammer prices raised by PREMIUM_RATE (default 20%), so all prices roughly include buyer's premium.",
-  "log_price_adj", NA, "Price (targets)", "target", "Natural log of `price_adj_usd`.",
-  "price_local", NA, "Price (targets)", "LEAK", "Sale price in the local currency (source `bidding_currency`).",
-  "cpi", "cpi", "Price (targets)", "info", "Consumer price index used for `price_real_usd`.",
-
-  # Pre-sale estimates -----------------------------------------------------------
-  "est_low_usd", "estimate_min_usd", "Pre-sale estimates", "estimate", "Auction house's low estimate, USD.",
-  "est_high_usd", "estimate_max_usd", "Pre-sale estimates", "estimate", "High estimate, USD.",
-  "est_mid_usd", "estimate_center_usd", "Pre-sale estimates", "estimate", "Midpoint of low and high estimates, USD.",
-  "log_est_mid", NA, "Pre-sale estimates", "estimate", "Natural log of `est_mid_usd`.",
-  "log10_est_geomean", "log10_estimate_geo_mean_usd", "Pre-sale estimates", "estimate", "log10 of the geometric mean of low and high estimates (source).",
-  "est_range_usd", "estimate_range_usd", "Pre-sale estimates", "estimate", "High minus low estimate, USD.",
-  "est_low_local", NA, "Pre-sale estimates", "estimate", "Low estimate in the local currency (`sale_currency`).",
-  "est_high_local", NA, "Pre-sale estimates", "estimate", "High estimate in the local currency (`sale_currency`).",
-  "in_est_range", NA, "Pre-sale estimates", "LEAK", "1 if the price fell within the estimate range (uses the price).",
-
-  # Artwork ------------------------------------------------------------------------
-  "title", "lot_title", "Artwork", "info", "Title of the work (HTML entities decoded).",
-  "genre", NA, "Artwork", "feature", "Painting, Photograph, Drawing, Print, Sculpture (1 row) or Other. Decoded from the source's numeric code; labels inferred by us.",
-  "materials", NA, "Artwork", "feature", "Materials code 1-17 from the source; no key published. Treat as categorical.",
-  "height_in", "height.x", "Artwork", "feature", "Height, inches.",
-  "width_in", "width.x", "Artwork", "feature", "Width, inches.",
-  "area_sqin", "size_inchsqr", "Artwork", "feature", "Height x width, square inches.",
-  "log_area", NA, "Artwork", "feature", "Natural log of `area_sqin`.",
-  "aspect_ratio", NA, "Artwork", "feature", "Height / width.",
-  "year_made", "year_of_artwork", "Artwork", "feature", "Year the work was made (about 6% missing).",
-  "work_age", NA, "Artwork", "feature", "`sale_year - year_made`, in years (negative values set to NA).",
-  "is_untitled", NA, "Artwork", "feature", "1 if titled Untitled / Sans titre / Senza titolo / Ohne Titel.",
-  "is_multi_work", NA, "Artwork", "feature", "1 if the lot is a set, e.g. '[Two Works]'.",
-  "has_provenance", NA, "Artwork", "feature", "1 if the lot listed any provenance.",
-  "in_main_genre", "matched_genre", "Artwork", "feature", "1 if the work is in the artist's main genre.",
-  "sold_in_home_country", "matched_country", "Artwork", "feature", "1 if sold in the artist's working country.",
-  "image_url", NA, "Artwork", "info", "URL of the lot image (may no longer be live).",
-
-  # Artist ---------------------------------------------------------------------------
-  "artist", "artist_name", "Artist", "feature", "Artist name. Use as a grouping variable, or target-encode within training folds only.",
-  "artist_nationality", "nationality", "Artist", "feature", "Artist nationality.",
-  "artist_living_country", NA, "Artist", "feature", "Country the artist lives in, grouped; 'unknown' where missing.",
-  "artist_birth_year", NA, "Artist", "feature", "Birth year.",
-  "artist_age", "age", "Artist", "feature", "Artist's age at the sale.",
-  "artist_gender", NA, "Artist", "feature", "female / male / unknown.",
-  "artist_edu_place", NA, "Artist", "feature", "Where the artist studied: domestic / abroad / both / unknown.",
-  "artist_degree", NA, "Artist", "feature", "Highest degree: none / undergraduate / graduate / unknown.",
-  "artist_elite_school", NA, "Artist", "feature", "Attended an elite art school: elite / non_elite / unknown.",
-  "artist_elite_award", NA, "Artist", "feature", "Won an elite art award: received / not_received.",
-  "artist_has_bio", NA, "Artist", "feature", "1 if a biography was available.",
-
-  # Artist reputation -----------------------------------------------------------------
-  "artist_rank", "ranking", "Artist reputation", "feature", "Global artist ranking at the time of sale (lower = more prominent), based on US and European sources.",
-  "artist_n_solo", "solo_show", "Artist reputation", "feature", "Solo exhibitions up to the auction year.",
-  "artist_n_group", "group_show", "Artist reputation", "feature", "Group exhibitions up to the auction year.",
-  "artist_n_biennials", "fest_biennal", "Artist reputation", "feature", "Art fair / biennial participations.",
-  "artist_n_private_acq", "private_inst", "Artist reputation", "feature", "Acquisitions by private collections.",
-  "artist_n_museum_acq", "public_inst", "Artist reputation", "feature", "Acquisitions by museums / public institutions.",
-
-  # Artist price history (safe) ---------------------------------------------------------
-  "artist_sale_seq", "artwork_order", "Artist price history", "feature", "Position of this sale in the artist's full auction history.",
-  "prev5_mean_usd", "price_usd_prev_5_mean", "Artist price history", "feature", "Mean price of the artist's previous 5 sales, USD.",
-  "prev5_med_usd", "price_usd_prev_5_median", "Artist price history", "feature", "Median price, previous 5 sales.",
-  "prev5_min_usd", "price_usd_prev_5_min", "Artist price history", "feature", "Minimum price, previous 5 sales.",
-  "prev5_max_usd", "price_usd_prev_5_max", "Artist price history", "feature", "Maximum price, previous 5 sales.",
-  "prev10_mean_usd", "price_usd_prev_10_mean", "Artist price history", "feature", "Mean price of the artist's previous 10 sales, USD.",
-  "prev10_med_usd", "price_usd_prev_10_median", "Artist price history", "feature", "Median price, previous 10 sales.",
-  "prev10_min_usd", "price_usd_prev_10_min", "Artist price history", "feature", "Minimum price, previous 10 sales.",
-  "prev10_max_usd", "price_usd_prev_10_max", "Artist price history", "feature", "Maximum price, previous 10 sales.",
-  "prev5_sizeadj_mean", "price_same_size_prev_5_mean", "Artist price history", "feature", "Mean of the previous 5 prices, standardized to this work's size (source; method not documented).",
-  "prev5_sizeadj_med", "price_same_size_prev_5_median", "Artist price history", "feature", "Median, previous 5, size-standardized.",
-  "prev5_sizeadj_min", "price_same_size_prev_5_min", "Artist price history", "feature", "Minimum, previous 5, size-standardized.",
-  "prev5_sizeadj_max", "price_same_size_prev_5_max", "Artist price history", "feature", "Maximum, previous 5, size-standardized.",
-  "prev10_sizeadj_mean", "price_same_size_prev_10_mean", "Artist price history", "feature", "Mean, previous 10, size-standardized.",
-  "prev10_sizeadj_med", "price_same_size_prev_10_median", "Artist price history", "feature", "Median, previous 10, size-standardized.",
-  "prev10_sizeadj_min", "price_same_size_prev_10_min", "Artist price history", "feature", "Minimum, previous 10, size-standardized.",
-  "prev10_sizeadj_max", "price_same_size_prev_10_max", "Artist price history", "feature", "Maximum, previous 10, size-standardized.",
-  "prior_n_sales", NA, "Artist price history", "feature", "Artist's sales in this file on earlier dates (computed here).",
-  "prior_mean_log_price", NA, "Artist price history", "feature", "Mean `log_price` of the artist's sales on earlier dates; NA on their first date (computed here).",
-  "prior_max_log_price", NA, "Artist price history", "feature", "Max `log_price` of the artist's sales on earlier dates (computed here).",
-
-  # Same-year price stats (leak) ----------------------------------------------------------
-  "yr_mean_ppsi", "meanprice_year", "Same-year price stats", "LEAK", "Artist's mean price per square inch in the sale year.",
-  "yr_med_ppsi", "medianprice_year", "Same-year price stats", "LEAK", "Artist's median price per square inch in the sale year.",
-  "yr_min_ppsi", "min_price", "Same-year price stats", "LEAK", "Artist's minimum price per square inch in the sale year.",
-  "yr_max_ppsi", "max_price", "Same-year price stats", "LEAK", "Artist's maximum price per square inch in the sale year.",
-  "ctry_yr_mean_ppsi", "cnt_mean", "Same-year price stats", "LEAK", "Artist's mean price per square inch in the sale country that year.",
-  "ctry_yr_med_ppsi", "cnt_median", "Same-year price stats", "LEAK", "Same, median.",
-  "ctry_yr_min_ppsi", "cnt_min", "Same-year price stats", "LEAK", "Same, minimum.",
-  "ctry_yr_max_ppsi", "cnt_max", "Same-year price stats", "LEAK", "Same, maximum.",
-  "cont_yr_mean_ppsi", "cot_mean", "Same-year price stats", "LEAK", "Artist's mean price per square inch on the sale continent that year.",
-  "cont_yr_med_ppsi", "cot_median", "Same-year price stats", "LEAK", "Same, median.",
-  "cont_yr_min_ppsi", "cot_min", "Same-year price stats", "LEAK", "Same, minimum.",
-  "cont_yr_max_ppsi", "cot_max", "Same-year price stats", "LEAK", "Same, maximum.",
-
-  # Data-quality flags --------------------------------------------------------------------
-  "flag_size", NA, "Data-quality flags", "flag", "1 if height or width exceeds MAX_SIDE_IN (default 300 in); likely a unit error.",
-  "flag_birth_record", NA, "Data-quality flags", "flag", "1 if the source birth field lists a death year for a living artist; artist details may be mismatched.",
-  "flag_age", NA, "Data-quality flags", "flag", "1 if `artist_age` disagrees with `sale_year - artist_birth_year` by more than 1.",
-  "flag_title_garbled", NA, "Data-quality flags", "flag", "1 if accented characters in the title were lost in the source (shown as '?').",
-  "flag_year_made_missing", NA, "Data-quality flags", "flag", "1 if `year_made` is missing."
-)
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 unescape_html <- function(x) {
-  x |>
-    str_replace_all(c("&#0?39;" = "'", "&#0?34;" = "\"", "&quot;" = "\"",
-                      "&lt;" = "<", "&gt;" = ">", "&amp;" = "&")) |>
+  str_replace_all(x, c("&#0?39;" = "'", "&#0?34;" = "\"", "&quot;" = "\"",
+                       "&lt;" = "<", "&gt;" = ">", "&amp;" = "&")) |>
     str_squish()
 }
 
-# Collapse a block of 0/1 columns into one factor; rows with no flag set -> "unknown"
-collapse_onehot <- function(df, labels) {
-  m <- df |> select(all_of(names(labels))) |>
-    mutate(across(everything(), \(v) replace_na(v, 0))) |> as.matrix()
-  n_set <- rowSums(m)
-  if (any(n_set > 1)) stop("More than one flag set in block starting ", names(labels)[1])
-  out <- unname(labels[max.col(m, ties.method = "first")])
-  out[n_set == 0] <- "unknown"
-  factor(out)
+# Collapse a block of 0/1 dummy columns into one factor ("unknown" if none is set)
+from_dummies <- function(cols, labels = cols) {
+  m <- as.matrix(raw[cols])
+  m[is.na(m)] <- 0
+  stopifnot(all(rowSums(m) <= 1))
+  factor(if_else(rowSums(m) == 0, "unknown", labels[max.col(m, ties.method = "first")]))
 }
 
-prefix_labels <- function(df, prefix) {
-  cols   <- names(df)[startsWith(names(df), prefix)]
-  labels <- str_replace_all(str_remove(cols, fixed(prefix)), fixed("."), " ")
-  labels <- recode(labels, Dutch = "Netherlands", Swiss = "Switzerland", Italia = "Italy")
-  set_names(labels, cols)
+# Same, for blocks named by a prefix, e.g. "Country...France"
+from_prefix <- function(prefix) {
+  cols   <- names(raw)[startsWith(names(raw), prefix)]
+  labels <- str_remove(cols, fixed(prefix)) |>
+    str_replace_all(fixed("."), " ") |>
+    recode(Dutch = "Netherlands", Swiss = "Switzerland", Italia = "Italy")
+  from_dummies(cols, labels)
 }
 
-# ---------------------------------------------------------------------------
-# Read
-# ---------------------------------------------------------------------------
-raw <- read_csv(in_path,
-                locale = locale(encoding = "latin1"),   # file is not UTF-8
-                name_repair = "minimal",                # keep names like Tier...1
-                guess_max = 30000, show_col_types = FALSE,
-                col_types = cols(Year.of.Birth = col_character(),
-                                 estimate_min = col_character(), estimate_max = col_character(),
-                                 bidding_currency = col_character()))
+# Genre codes are undocumented; labels inferred from known artists
+genre_labels <- c("Painting", "Photograph", "Drawing", "Print", "Sculpture", "Other")
+untitled_rx  <- regex("untitled|sans titre|senza titolo|ohne titel", ignore_case = TRUE)
+multi_rx     <- regex("[\\[(]\\s*\\w+ works[\\])]", ignore_case = TRUE)
 
-# ---------------------------------------------------------------------------
-# Build new columns
-# ---------------------------------------------------------------------------
-untitled_rx <- regex("untitled|sans titre|senza titolo|ohne titel", ignore_case = TRUE)
-multi_rx    <- regex("\\[\\s*\\w+ works\\]|\\(\\s*\\w+ works\\)", ignore_case = TRUE)
+# --- Clean -------------------------------------------------------------------
 
-onehots <- list(
-  house_tier            = prefix_labels(raw, "Tier..."),
-  sale_country          = prefix_labels(raw, "Country..."),
-  sale_continent        = prefix_labels(raw, "Continent..."),
-  artist_living_country = prefix_labels(raw, "Living..."),
-  artist_gender         = c(gender_female = "female", gender_male = "male", gender_NA = "unknown"),
-  artist_edu_place      = c(edu_domestic = "domestic", edu_abroad = "abroad", edu_both = "both", edu_NA = "unknown"),
-  artist_degree         = c(no_degree = "none", undergrad = "undergraduate", grad = "graduate", degree_NA = "unknown"),
-  artist_elite_school   = c(elite_school = "elite", non_elite_school = "non_elite", elite_school_NA = "unknown"),
-  artist_elite_award    = c(elite_award_received = "received", elite_award_not_received = "not_received")
-)
-
-df <- raw |>
-  mutate(across(c(artist_name, lot_title, auction_house, event.name, nationality, country, provenance),
-                unescape_html))
-
-for (new in names(onehots)) df[[new]] <- collapse_onehot(df, onehots[[new]])
-
-df <- df |>
+auctions_clean <- raw |>
   mutate(
+    across(c(artist_name, auction_house, nationality), unescape_html),
+
+    # one-hot blocks -> single factors
+    house_tier            = from_prefix("Tier..."),
+    sale_country          = from_prefix("Country..."),
+    sale_continent        = from_prefix("Continent..."),
+    artist_country        = from_prefix("Living..."),
+    artist_gender         = from_dummies(c("gender_female", "gender_male", "gender_NA"),
+                                         c("female", "male", "unknown")),
+    artist_education      = from_dummies(c("edu_domestic", "edu_abroad", "edu_both", "edu_NA"),
+                                         c("domestic", "abroad", "both", "unknown")),
+    artist_degree         = from_dummies(c("no_degree", "undergrad", "grad", "degree_NA"),
+                                         c("none", "undergraduate", "graduate", "unknown")),
+    artist_elite_school   = from_dummies(c("elite_school", "non_elite_school", "elite_school_NA"),
+                                         c("elite", "non_elite", "unknown")),
+    artist_elite_award    = from_dummies(c("elite_award_received", "elite_award_not_received"),
+                                         c("received", "not_received")),
+
     # sale
     sale_date  = ymd(eventdate),
     sale_month = month(sale_date),
-    lot_no     = as.integer(str_extract(lot, "\\d+")),
     is_hammer  = as.integer(Ham_Prem == "Hammer"),
 
-    # price
-    log_price      = log(price_usd.x),
-    log_price_real = log(real_price_usd),
-    price_adj_usd  = if_else(is_hammer == 1, price_usd.x * (1 + PREMIUM_RATE), as.numeric(price_usd.x)),
-    log_price_adj  = log(price_adj_usd),
-    price_local    = parse_number(bidding_currency),
+    # prices
+    log_price        = log(price_usd.x),
+    log_price_real   = log(real_price_usd),
+    log_estimate_mid = log(estimate_center_usd),
 
-    # estimates
-    log_est_mid    = log(estimate_center_usd),
-    est_low_local  = parse_number(estimate_min),
-    est_high_local = parse_number(estimate_max),
-    in_est_range   = as.integer(price_usd.x >= estimate_min_usd & price_usd.x <= estimate_max_usd),
+    # artwork: implausible sizes -> NA
+    bad_size = replace_na(height.x > MAX_SIDE_IN | width.x > MAX_SIDE_IN, FALSE),
+    across(c(height.x, width.x, size_inchsqr), \(v) replace(v, bad_size, NA)),
+    log_area          = log(size_inchsqr),
+    aspect_ratio      = height.x / width.x,
+    work_age          = if_else(year - year_of_artwork >= 0, year - year_of_artwork, NA),
+    genre             = factor(genre_labels[genre], levels = genre_labels),
+    materials         = factor(materials),
+    is_untitled       = as.integer(str_detect(replace_na(lot_title, ""), untitled_rx)),
+    is_multiple_works = as.integer(str_detect(replace_na(lot_title, ""), multi_rx)),
+    has_provenance    = as.integer(!is.na(provenance)),
 
+    # artist: age -> NA if the birth record lists a death year or disagrees with age
+    birth_year = as.integer(str_extract(Year.of.Birth, "\\d{4}")),
+    bad_age    = str_detect(replace_na(Year.of.Birth, ""), fixed("d.")) |
+                 replace_na(abs(year - birth_year - age) > 1, FALSE),
+    artist_age     = replace(age, bad_age, NA),
+    artist_has_bio = as.integer(biography == "Y")
+  ) |>
+  select(
+    # ids
+    row_id = case_id, is_train = train,
+    # sale
+    sale_date, sale_year = year, sale_month, auction_house, house_tier,
+    sale_country, sale_continent, is_hammer,
+    # prices (targets)
+    price_usd = price_usd.x, price_real_usd = real_price_usd, log_price, log_price_real,
+    # pre-sale estimates
+    estimate_low_usd = estimate_min_usd, estimate_high_usd = estimate_max_usd, log_estimate_mid,
     # artwork
-    genre          = factor(unname(GENRE_LABELS[as.character(genre)]), levels = unname(GENRE_LABELS)),
-    materials      = factor(materials),
-    log_area       = log(size_inchsqr),
-    aspect_ratio   = height.x / width.x,
-    work_age       = if_else(year - year_of_artwork < 0, NA_real_, as.numeric(year - year_of_artwork)),
-    is_untitled    = as.integer(str_detect(replace_na(lot_title, ""), untitled_rx)),
-    is_multi_work  = as.integer(str_detect(replace_na(lot_title, ""), multi_rx)),
-    has_provenance = as.integer(!is.na(provenance)),
-    image_url      = str_match(img_link, 'src="([^"]+)"')[, 2],
-
+    genre, materials, height_in = height.x, width_in = width.x, area_sq_in = size_inchsqr,
+    log_area, aspect_ratio, year_made = year_of_artwork, work_age,
+    is_untitled, is_multiple_works, has_provenance,
+    in_main_genre = matched_genre, sold_in_home_country = matched_country,
     # artist
-    artist_birth_year = as.integer(str_extract(Year.of.Birth, "\\d{4}")),
-    artist_has_bio    = as.integer(biography == "Y"),
-
-    # flags
-    flag_size              = as.integer(height.x > MAX_SIDE_IN | width.x > MAX_SIDE_IN),
-    flag_birth_record      = as.integer(str_detect(replace_na(Year.of.Birth, ""), fixed("d."))),
-    flag_age               = as.integer(replace_na(abs(year - artist_birth_year - age) > 1, FALSE)),
-    flag_title_garbled     = as.integer(str_detect(replace_na(lot_title, ""), fixed("?"))),
-    flag_year_made_missing = as.integer(is.na(year_of_artwork))
-  )
-
-# Leakage-safe artist history: only sales on EARLIER dates
-history <- df |>
-  group_by(artist_name, sale_date) |>
-  summarise(day_sum = sum(log_price), day_n = n(), day_max = max(log_price), .groups = "drop") |>
-  arrange(artist_name, sale_date) |>
-  group_by(artist_name) |>
-  mutate(prior_n_sales        = cumsum(day_n) - day_n,
-         prior_mean_log_price = (cumsum(day_sum) - day_sum) / na_if(prior_n_sales, 0),
-         prior_max_log_price  = lag(cummax(day_max))) |>
-  ungroup() |>
-  select(artist_name, sale_date, starts_with("prior_"))
-
-df <- left_join(df, history, by = c("artist_name", "sale_date"))
-
-# ---------------------------------------------------------------------------
-# Rename and keep exactly the columns in the spec, in spec order
-# ---------------------------------------------------------------------------
-renames <- spec |> filter(!is.na(from)) |> select(name, from) |> deframe()
-missing_src <- setdiff(renames, names(df))
-if (length(missing_src)) stop("Source columns not found: ", str_c(missing_src, collapse = ", "))
-
-clean <- df |>
-  rename(all_of(renames)) |>
-  select(all_of(spec$name)) |>
+    artist = artist_name, artist_nationality = nationality, artist_country, artist_age,
+    artist_gender, artist_education, artist_degree, artist_elite_school,
+    artist_elite_award, artist_has_bio,
+    # artist reputation
+    artist_rank = ranking, solo_shows = solo_show, group_shows = group_show,
+    biennials = fest_biennal, private_collection_buys = private_inst,
+    museum_buys = public_inst,
+    # artist price history (earlier sales only)
+    artist_sale_number = artwork_order,
+    mean_price_last5_usd  = price_usd_prev_5_mean,  median_price_last5_usd  = price_usd_prev_5_median,
+    mean_price_last10_usd = price_usd_prev_10_mean, median_price_last10_usd = price_usd_prev_10_median
+  ) |>
   arrange(sale_date, row_id)
-
-write_csv(clean, file.path(out_dir, "auctions_clean.csv"), na = "")
-
-# ---------------------------------------------------------------------------
-# Data dictionary (Markdown)
-# ---------------------------------------------------------------------------
-col_type <- function(v) {
-  if (is.factor(v)) "category" else if (inherits(v, "Date")) "date"
-  else if (is.character(v)) "text"
-  else if (all(v %in% c(0, 1, NA))) "0/1"
-  else if (is.numeric(v) && all(v == round(v), na.rm = TRUE)) "integer"
-  else "number"
-}
-
-dict <- spec |>
-  mutate(type    = map_chr(name, \(n) col_type(clean[[n]])),
-         missing = map_dbl(name, \(n) mean(is.na(clean[[n]]))),
-         missing = case_when(missing == 0 ~ "", missing < 0.001 ~ "<0.1%",
-                             TRUE ~ sprintf("%.1f%%", 100 * missing)),
-         values  = map_chr(name, \(n) {
-           v <- clean[[n]]
-           if (is.factor(v)) str_c(levels(v), collapse = ", ") else ""
-         }),
-         desc = if_else(!name %in% c("sale_country", "sale_continent", "artist_living_country"), desc,
-                        str_c(desc, " Values: ", values, ".")))
-
-n_flag <- \(col) format(sum(clean[[col]], na.rm = TRUE), big.mark = ",")
-
-md <- c(
-  "# Data dictionary: auctions_clean.csv", "",
-  str_glue("{format(nrow(clean), big.mark = ',')} auction sales of works by {n_distinct(clean$artist)} living contemporary artists, ",
-           "{min(clean$sale_year)}-{max(clean$sale_year)}, {ncol(clean)} columns. ",
-           "Source: Lee et al. (2024), *Scientific Reports*, data at doi:10.6084/m9.figshare.24746268."),
-  "",
-  "## How to use the columns", "",
-  "The **Use** column tells you what each variable is safe for:", "",
-  "- **target**: a version of the sale price. Pick one to predict; never use one as an input.",
-  "- **LEAK**: contains this sale's price (directly or inside a same-year average). Never use as a feature.",
-  "- **estimate**: the auction house's pre-sale estimate. Known before the sale, but it nearly determines the price, so compare models with and without it.",
-  "- **feature**: safe model input.",
-  "- **flag**: data-quality marker (1 = problem). Use to filter, or as a feature.",
-  "- **id** / **info**: identifiers and descriptive text, not model inputs.",
-  "",
-  str_glue("**Never use as model inputs:** {str_c('`', spec$name[spec$use %in% c('target', 'LEAK')], '`', collapse = ', ')}."),
-  "",
-  "Abbreviations: **ppsi** = price per square inch (inflation-adjusted USD); **prev5 / prev10** = the artist's previous 5 / 10 sales; **ctry / cont / yr** = country / continent / year.",
-  "",
-  "## Data notes", "",
-  str_glue("- **Genre labels are inferred.** The source stores genre as codes 1-6 and does not document them. We matched them using known artists (e.g. Cindy Sherman's works are all code 2 = Photograph; Jasper Johns' are mostly 4 = Print). The source's one-hot genre columns had the wrong names and were dropped."),
-  str_glue("- **Prices mix hammer and premium.** {round(100 * mean(clean$is_hammer))}% of prices exclude the buyer's premium; `price_adj_usd` puts them on a common footing using an assumed {PREMIUM_RATE * 100}% premium."),
-  str_glue("- **Split:** `is_train` is the authors' time-based split ({format(sum(clean$is_train), big.mark = ',')} train / {format(sum(clean$is_train == 0), big.mark = ',')} test)."),
-  str_glue("- **Flags:** {n_flag('flag_size')} rows with an implausible size, {n_flag('flag_birth_record')} with a suspect birth record, {n_flag('flag_age')} with an inconsistent age, {n_flag('flag_title_garbled')} with garbled titles. Flagged rows are kept."),
-  "- **Same-year price stats leak.** They are computed over all of the artist's sales that year, including this one: for artists with a single sale in a year, the yearly mean usually equals that sale's own price per square inch, and every sale falls inside its yearly min-max. Use the `prev*` and `prior_*` columns instead.",
-  "- **Dropped from the source:** duplicate columns from the join (`.y` copies, `event_year`, `event.date`, `est_currency`), empty columns (`artfacts_id`, `alive_id`, `depth`), prices in EUR/GBP, price per inch, raw HTML, and all one-hot blocks (now single category columns)."
-)
-
-for (sec in unique(dict$section)) {
-  sub <- filter(dict, section == sec)
-  md <- c(md, "", str_glue("## {sec}"), "",
-          "| Column | Use | Type | Missing | Description |",
-          "|---|---|---|---|---|",
-          str_glue_data(sub, "| `{name}` | {use} | {type} | {missing} | {desc} |"))
-}
-write_lines(md, file.path(out_dir, "data_dictionary.md"))
-
-message("Wrote ", nrow(clean), " rows x ", ncol(clean), " columns to ", file.path(out_dir, "auctions_clean.csv"),
-        "\nWrote ", file.path(out_dir, "data_dictionary.md"))
-```
-```{r}
-library(ggplot2)
-
-ggplot(clean, aes(x = factor(year_made), y = price_usd)) +
-    geom_boxplot() +
-    scale_y_log10()+
-    labs(title = "Boxplot of Price by Year", x = "Year", y = "Auction Price (log scale)")
 ```
 
+The final cleaned dataset contains `r format(nrow(auctions_clean), big.mark = ",")` observations and `r ncol(auctions_clean)` variables.
 
-```{r}
-ggplot(auctions, aes(x = genre)) +
-    geom_histogram(stat= count)
-```
+## Data dictionary: `auctions_clean`
+
+Each row is one auction sale of a work by a living contemporary artist, 2006–2012. Binary columns are coded 0/1, and money is in USD.
+
+**Leave out of the predictors:** all four price columns, because they are the outcome. The source's same-year price averages are dropped because they contain the sale's own price.
+
+| Column | Meaning |
+|---|---|
+| `row_id` | Unique row ID |
+| `is_train` | Authors' time-based split: 1 = train (2006–2011), 0 = test (2011–2012) |
+| `sale_date`, `sale_year`, `sale_month` | When the auction took place |
+| `auction_house` | Auction house name |
+| `house_tier` | House prestige tier, 1 (Christie's, Sotheby's, Phillips) to 4 |
+| `sale_country`, `sale_continent` | Where the sale took place (smaller countries grouped as "Others") |
+| `is_hammer` | 1 = the recorded price excludes the buyer's premium |
+| `price_usd`, `log_price` | Sale price, nominal |
+| `price_real_usd`, `log_price_real` | Sale price, adjusted for inflation |
+| `estimate_low_usd`, `estimate_high_usd` | Auction house's pre-sale estimate range |
+| `log_estimate_mid` | Log of the estimate midpoint. Known before the sale but very close to the price, so compare models with and without it |
+| `genre` | Painting, Photograph, Drawing, Print, Sculpture or Other (labels inferred from undocumented codes) |
+| `materials` | Materials code 1–17 (no key published) |
+| `height_in`, `width_in`, `area_sq_in`, `log_area`, `aspect_ratio` | Size in inches. NA where a side was over 300 in (likely a unit error) |
+| `year_made`, `work_age` | Year the work was made, and its age at sale |
+| `is_untitled` | 1 = titled "Untitled" (or the French, Italian or German equivalent) |
+| `is_multiple_works` | 1 = the lot is a set of works |
+| `has_provenance` | 1 = the lot listed a provenance |
+| `in_main_genre` | 1 = the work is in the artist's main genre |
+| `sold_in_home_country` | 1 = sold in the country where the artist works |
+| `artist` | Artist name. Use as a grouping variable or random effect |
+| `artist_nationality`, `artist_country` | Nationality, and the country the artist lives in |
+| `artist_age` | Age at sale. NA where the birth record was inconsistent |
+| `artist_gender` | female / male / unknown |
+| `artist_education` | Where they studied: domestic / abroad / both / unknown |
+| `artist_degree` | none / undergraduate / graduate / unknown |
+| `artist_elite_school`, `artist_elite_award` | Attended an elite art school; won an elite award |
+| `artist_has_bio` | 1 = a biography was available |
+| `artist_rank` | Global artist ranking at time of sale (lower = more prominent) |
+| `solo_shows`, `group_shows`, `biennials` | Exhibition counts up to the sale year |
+| `private_collection_buys`, `museum_buys` | Number of acquisitions by private collections and by museums |
+| `artist_sale_number` | Position of this sale in the artist's auction history |
+| `mean_price_last5_usd`, `median_price_last5_usd` | Mean and median price of the artist's previous 5 sales |
+| `mean_price_last10_usd`, `median_price_last10_usd` | Same, for the previous 10 sales |
 
 
-### Inital model fitting
+
+# Initial model fitting
 
 ```{r}
 library(MASS)
@@ -410,40 +205,40 @@ library(MASS)
 
 
 ```{r}
-#plot(clean$log_price)
-#plot(clean$price_usd)
+#plot(auctions_clean$log_price)
+#plot(auctions_clean$price_usd)
 
 
 # remove predictors 
-model_df <- clean |>
-  select(
-    -c(log_price, price_real_usd, log_price_real, price_adj_usd, log_price_adj),  # other transformations of the response
-    -price_local, -in_est_range, -matches("_ppsi$"), # variables that depend on the response
-    -starts_with("est_"), -log_est_mid, -log10_est_geomean, # estimates of the response from experts
-    -c(row_id, artist_id, lot_id, lot_no, sale_name, title, image_url, # id vars/not predictors
-       sale_country_raw, sale_currency, cpi, sale_date, artist) 
-  ) |>
-  mutate(across(c(house_tier, materials), as.factor))
-
+model_df <- auctions_clean |>
+  dplyr::select(
+    -c(log_price, price_real_usd, log_price_real),                     # other transformations of the response
+    -c(estimate_low_usd, estimate_high_usd, log_estimate_mid),         # experts' estimates of the response
+    -c(row_id, sale_date, artist)                                      # ids / not predictors
+  )
 ols <- lm(price_usd ~ ., data = model_df)
 summary(ols)
 
 #transform y
-bc <- boxcox(ols, lambda = seq(-.1, 0, 0.05))
+bc <- boxcox(ols, lambda = seq(-0.3, 0.3, 0.01))
 lambda <- bc$x[which.max(bc$y)]
+lambda_ci <- range(bc$x[bc$y > max(bc$y) - qchisq(0.95, 1) / 2])   # 95% CI for lambda
 lambda
+lambda_ci
 
 # refit ols with transformed response
 ols_y_trans <- lm(I(price_usd^(lambda)) ~ ., data = model_df)
 summary(ols_y_trans)
 ```
-From the box cox transformation we use a lambda of $-0.06565657$, the center of the confidence interval, because neither $0$ nor $1$ are in the confidence interval.
 
-We see that the (almost) log transformation of the response increases the Multiple R-squared of the OLS model by almost $.3$. 
 
-We notice that many of the predictors have estimates of NA. This means that we have a lot of colinearity in the data. 
+From the Box-Cox transformation we use $\lambda =$ `r round(lambda, 3)`, the value that maximizes the profile log-likelihood. Its 95% confidence interval is [`r round(lambda_ci[1], 3)`, `r round(lambda_ci[2], 3)`], which does not contain $0$ (a log transformation) and does not contain $1$ (no transformation).  
 
-Thus we think that the model assumptions are not met. We check the model assumptions
+The (almost) log transformation of the response raises the multiple $R^2$ of the OLS model from `r round(summary(ols)$r.squared, 3)` to `r round(summary(ols_y_trans)$r.squared, 3)`, an increase of `r round(summary(ols_y_trans)$r.squared - summary(ols)$r.squared, 3)`.
+
+`r sum(is.na(coef(ols_y_trans)))` of the `r length(coef(ols_y_trans))` coefficients are estimated as NA. R does this when a column is an exact linear combination of others (for example, nested location categories), so the data contain perfect collinearity, on top of strong correlation among related predictors such as the size variables and the artist's previous sale prices.
+
+Thus, we think that the model assumptions are not met. We check the model assumptions:
 
 ```{r}
 plot(fitted(ols_y_trans), resid(ols_y_trans), xlab = "Fitted", ylab = "Residuals")
@@ -453,6 +248,182 @@ qqnorm(resid(ols_y_trans))
 qqline(resid(ols_y_trans), col = "blue3")
 
 ```
+
+
 From the first plot it is hard to tell how much heterogenity we have, but certainly the variance of the first few residuals are a lot lower than the rest. From the second plots we see that the residuals are not normally distributed because they largely differ from the normal Q-Q plot.
 
-Because of the colinearty and model assumptions a linear model is probably not a good model here, so we will try other models such as lasso.  
+Because of the collinearity and model assumptions, OLS is probably not a good approach here, so we will try other models such as lasso and ridge regression.
+
+For the penalized models we model the log of the inflation-adjusted price, collapse factors with many rare levels, and drop rows with missing values. That removes `r format(nrow(auctions_clean) - nrow(model_df), big.mark = ",")` rows (`r round(100 * (nrow(auctions_clean) - nrow(model_df)) / nrow(auctions_clean), 1)`%), leaving `r format(nrow(model_df), big.mark = ",")` sales and `r ncol(x)` predictor columns. The data are split at random into `r format(length(y_train), big.mark = ",")` training and `r format(length(y_test), big.mark = ",")` test sales, and every model is scored on the same test set.
+
+```{r}
+library(tidyverse)
+library(glmnet)
+
+# Predictors + response (log real price), with high-cardinality factors collapsed
+model_df <- auctions_clean |>
+  dplyr::select(
+    -c(price_usd, log_price, price_real_usd),                  # other transformations of the response
+    -c(estimate_low_usd, estimate_high_usd, log_estimate_mid), # experts' estimates of the response
+    -c(row_id, sale_date, artist, is_train),                   # ids / not predictors
+    -auction_house                                             # hundreds of levels; house_tier summarizes it
+  ) |>
+  mutate(across(where(is.numeric), \(v) if_else(is.finite(v), v, NA))) |>  # Inf -> NA
+  drop_na() |>
+  mutate(
+    artist_nationality = fct_lump_n(artist_nationality, 10),  # top 10 nationalities + "Other"
+    artist_country     = fct_lump_n(artist_country, 10),      # top 10 countries + "Other"
+    materials          = fct_lump_prop(materials, 0.01),      # codes with < 1% of rows -> "Other"
+    genre              = fct_collapse(genre, Other = c("Other", "Sculpture"))  # Sculpture is ~1 row
+  ) |>
+  droplevels()
+
+# Design matrix built once on all rows, so train and test share the same columns
+x <- model.matrix(log_price_real ~ ., data = model_df)[, -1]
+y <- model_df$log_price_real
+stopifnot(nrow(x) == length(y))
+
+nrow(auctions_clean) - nrow(model_df)   # rows dropped for missing values
+ncol(x)                                 # number of predictor columns
+
+# Random 75/25 train / test split (shared by every model below)
+set.seed(1)
+train_rows <- sample(nrow(x), size = floor(0.75 * nrow(x)))
+x_train <- x[train_rows, ];  y_train <- y[train_rows]
+x_test  <- x[-train_rows, ]; y_test  <- y[-train_rows]
+
+# Test-set RMSE and R^2 (log scale), used for every model
+test_metrics <- function(pred) {
+  tibble(
+    rmse = sqrt(mean((y_test - pred)^2)),
+    r2   = 1 - sum((y_test - pred)^2) / sum((y_test - mean(y_test))^2)
+  )
+}
+```
+
+```{r}
+# Lasso (alpha = 1), lambda chosen by 10-fold CV
+set.seed(1)
+lasso_fit <- cv.glmnet(x_train, y_train, alpha = 1)
+plot(lasso_fit)
+c(lambda_min = lasso_fit$lambda.min, lambda_1se = lasso_fit$lambda.1se)
+
+# Variables the lasso kept
+coefs <- coef(lasso_fit, s = "lambda.1se")
+lasso_coefs <- tibble(term = rownames(coefs), estimate = as.numeric(coefs)) |>
+  filter(estimate != 0, term != "(Intercept)") |>
+  arrange(desc(abs(estimate)))
+nrow(lasso_coefs)   # number of predictors kept
+lasso_coefs
+
+lasso_pred <- as.numeric(predict(lasso_fit, newx = x_test, s = "lambda.1se"))
+lasso_metrics <- test_metrics(lasso_pred)
+lasso_metrics
+```
+
+Using $\lambda_{1se} =$ `r signif(lasso_fit$lambda.1se, 3)`, the lasso keeps `r nrow(lasso_coefs)` of the `r ncol(x)` predictor columns and sets the other `r ncol(x) - nrow(lasso_coefs)` to zero. The largest coefficients in absolute value belong to `r paste(head(lasso_coefs$term, 3), collapse = ", ")`. On the test set, the lasso has an RMSE of `r round(lasso_metrics$rmse, 3)` on the log scale (predictions are typically off by a factor of about `r round(exp(lasso_metrics$rmse), 2)`) and a test $R^2$ of `r round(lasso_metrics$r2, 3)`.
+
+
+
+```{r}
+# Ridge (alpha = 0), lambda chosen by 10-fold CV
+set.seed(1)
+ridge_fit <- cv.glmnet(x_train, y_train, alpha = 0)
+plot(ridge_fit)
+c(lambda_min = ridge_fit$lambda.min, lambda_1se = ridge_fit$lambda.1se)
+
+ridge_pred <- as.numeric(predict(ridge_fit, newx = x_test, s = "lambda.1se"))
+ridge_metrics <- test_metrics(ridge_pred)
+ridge_metrics
+```
+
+Ridge uses $\lambda_{1se} =$ `r signif(ridge_fit$lambda.1se, 3)`. It shrinks all `r ncol(x)` coefficients toward zero but keeps every predictor. Its test RMSE is `r round(ridge_metrics$rmse, 3)` and its test $R^2$ is `r round(ridge_metrics$r2, 3)`, slightly worse than" the lasso (`r round(lasso_metrics$r2, 3)`).  Interestingly enough, the lasso's smaller model slightly increases predictive accuracy. Ridge is often better when predictors are highly correlated, but here the lasso's variable selection seems to help. 
+
+However, both lasso and ridge do not explain enough of the variance in the test set, so it makes sense to try a model that accounts for more complex, nonlinear relationships within the data.
+
+
+```{r}
+library(ranger)
+
+# Same rows as the other models' train/test split; ranger handles factors directly
+train_df <- model_df[train_rows, ]
+test_df  <- model_df[-train_rows, ]
+p <- ncol(train_df) - 1   # number of predictors
+
+# Tuning grid
+grid <- expand_grid(
+  mtry          = c(floor(sqrt(p)), floor(p / 3), floor(p / 2)),
+  min.node.size = c(5, 20)
+)
+
+# 5-fold CV on the training set
+set.seed(1)
+folds <- sample(rep(1:5, length.out = nrow(train_df)))
+
+cv_rmse <- function(mtry, min.node.size) {
+  fold_mse <- map_dbl(1:5, \(k) {
+    fit  <- ranger(log_price_real ~ ., data = train_df[folds != k, ],
+                   num.trees = 300, mtry = mtry, min.node.size = min.node.size, seed = 1)
+    pred <- predict(fit, train_df[folds == k, ])$predictions
+    mean((train_df$log_price_real[folds == k] - pred)^2)
+  })
+  sqrt(mean(fold_mse))
+}
+
+cv_results <- grid |>
+  mutate(cv_rmse = map2_dbl(mtry, min.node.size, cv_rmse)) |>
+  arrange(cv_rmse)
+cv_results
+best <- slice(cv_results, 1)
+
+# Final forest on the full training set with the best settings
+rf_fit <- ranger(log_price_real ~ ., data = train_df,
+                 num.trees = 500, mtry = best$mtry, min.node.size = best$min.node.size,
+                 importance = "permutation", seed = 1)
+
+rf_pred <- predict(rf_fit, test_df)$predictions
+rf_metrics <- test_metrics(rf_pred)
+rf_metrics
+
+# Top 15 variables by permutation importance
+tibble(variable = names(rf_fit$variable.importance),
+       importance = rf_fit$variable.importance) |>
+  slice_max(importance, n = 15) |>
+  ggplot(aes(importance, fct_reorder(variable, importance))) +
+  geom_col() +
+  labs(x = "Permutation importance (increase in MSE)", y = NULL)
+```
+
+Five-fold cross-validation picked `mtry` = `r best$mtry` (of `r p` predictors) and a minimum leaf size of `r best$min.node.size`, with a CV RMSE of `r round(best$cv_rmse, 3)`. On the test set the random forest has an RMSE of `r round(rf_metrics$rmse, 3)` and an $R^2$ of `r round(rf_metrics$r2, 3)`, compared with `r round(lasso_metrics$r2, 3)` for the lasso. The most important variable is `r names(which.max(rf_fit$variable.importance))`, and the top three are `r paste(names(sort(rf_fit$variable.importance, decreasing = TRUE))[1:3], collapse = ", ")`.
+
+## Model comparison and assumptions
+
+```{r}
+model_results <- bind_rows(
+  lasso_metrics |> mutate(model = "Lasso", predictors = nrow(lasso_coefs)),
+  ridge_metrics |> mutate(model = "Ridge", predictors = ncol(x)),
+  rf_metrics    |> mutate(model = "Random forest", predictors = p)
+) |>
+  dplyr::select(model, predictors, rmse, r2) |>
+  arrange(rmse)
+model_results
+
+# Test-set residuals for the linear (lasso) model
+lasso_resid <- y_test - lasso_pred
+plot(lasso_pred, lasso_resid, xlab = "Fitted (lasso)", ylab = "Residuals")
+abline(h = 0, col = "blue3")
+
+qqnorm(lasso_resid)
+qqline(lasso_resid, col = "blue3")
+```
+
+The best model on the test set is the `r tolower(model_results$model[1])`, with an RMSE of `r round(model_results$rmse[1], 3)` and an $R^2$ of `r round(model_results$r2[1], 3)`. The gap between the best and worst model is `r round(max(model_results$r2) - min(model_results$r2), 3)` in $R^2$.
+
+**Assumptions.** Lasso and ridge are still linear models, so they assume the log price is linear in the predictors, and their residuals should look like the OLS residuals did. Penalization fixes the collinearity problem: it gives stable estimates where OLS returned NA. It does not fix non-normal or non-constant errors. Because we judge these models by cross-validation and test error, not by p-values, non-normal residuals matter less here than they did for OLS. The lasso's test residuals have a standard deviation of `r round(sd(lasso_resid), 3)`, and `r round(100 * mean(abs(lasso_resid) > 2 * sd(lasso_resid)), 1)`% of them are more than two standard deviations from zero (about 5% would be expected under normality). The random forest makes no linearity or normality assumption, so its higher test $R^2$ suggests that some of the relationships are nonlinear or involve interactions the linear models miss.
+
+All of these models assume the sales are independent. They aren't fully independent, because the same artist appears many times and the random split puts the same artists in both the training and test sets. The test errors above are therefore likely somewhat optimistic for predicting prices of new artists.
+
+
+# Obstacles and limitations
+
+Because the dataset is large, both in number of observations and in number of predictors, we have to be careful about overfitting. The lasso and ridge help with this by penalizing large coefficients, but they still assume linearity. The random forest can capture nonlinear relationships, and protects against overfitting, but it is more difficult to interpret. With such a large dataset, it makes sense to prioritize predictive accuracy over interpretability. However, we will also try to understand the most important predictors and their effects on price. Modeling such a complex dataset using linear methods is a challenge, and it is difficult to confirm whether or not the assumptions of the models are met. 
