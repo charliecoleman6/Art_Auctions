@@ -52,7 +52,7 @@ from_dummies <- function(cols, labels = cols) {
 }
 
 from_prefix <- function(prefix) {
-  cols <- names(raw)[startsWith(names(raw), prefix)]
+  cols   <- names(raw)[startsWith(names(raw), prefix)]
   labels <- str_remove(cols, fixed(prefix)) |>
     str_replace_all(fixed("."), " ") |>
     recode(Dutch = "Netherlands", Swiss = "Switzerland", Italia = "Italy")
@@ -71,15 +71,15 @@ auctions_clean <- raw |>
     sale_continent = from_prefix("Continent..."),
     artist_country = from_prefix("Living..."),
     artist_gender = from_dummies(c("gender_female", "gender_male", "gender_NA"),
-                                         c("female", "male", "unknown")),
+                                 c("female", "male", "unknown")),
     artist_education = from_dummies(c("edu_domestic", "edu_abroad", "edu_both", "edu_NA"),
-                                         c("domestic", "abroad", "both", "unknown")),
+                                    c("domestic", "abroad", "both", "unknown")),
     artist_degree = from_dummies(c("no_degree", "undergrad", "grad", "degree_NA"),
-                                         c("none", "undergraduate", "graduate", "unknown")),
+                                 c("none", "undergraduate", "graduate", "unknown")),
     artist_elite_school = from_dummies(c("elite_school", "non_elite_school", "elite_school_NA"),
-                                         c("elite", "non_elite", "unknown")),
+                                       c("elite", "non_elite", "unknown")),
     artist_elite_award = from_dummies(c("elite_award_received", "elite_award_not_received"),
-                                         c("received", "not_received")),
+                                      c("received", "not_received")),
 
     sale_date = ymd(eventdate),
     sale_month = month(sale_date),
@@ -103,7 +103,7 @@ auctions_clean <- raw |>
 
     birth_year = as.integer(str_extract(Year.of.Birth, "\\d{4}")),
     bad_age = str_detect(replace_na(Year.of.Birth, ""), fixed("d.")) |
-                 replace_na(abs(year - birth_year - age) > 1, FALSE),
+              replace_na(abs(year - birth_year - age) > 1, FALSE),
     artist_age = replace(age, bad_age, NA),
     artist_has_bio = as.integer(biography == "Y")
   ) |>
@@ -175,6 +175,8 @@ Each row is one auction sale of a work by a living contemporary artist, 2006–2
 | `mean_price_last5_usd`, `median_price_last5_usd` | Mean and median price of the artist's previous 5 sales |
 | `mean_price_last10_usd`, `median_price_last10_usd` | Same, for the previous 10 sales |
 
+
+
 # Initial model fitting
 
 Here we do pre variable selection. We collapse factors with many rare levels, and drop rows with missing values. We remove variables that are neither predictors nor response (such as ID variables), or do not offer insight to our research question such as expert estimates of the price.
@@ -242,7 +244,7 @@ qqnorm(resid(ols_y_trans))
 qqline(resid(ols_y_trans), col = "blue3")
 ```
 
-From the first plot it is hard to tell how much heterogenity we have, but certainly the variance of the first few residuals are a lot lower than the rest. From the second plots we see that the residuals are not normally distributed because they differ a lot from the normal Q-Q plot.
+From the first plot it is hard to tell how much heterogenity we have, but the residuals for the lowest fitted values all lie above zero, so the model is systematically off there, and the spread narrows at the highest fitted values. From the second plots we see that the residuals are close to normal in the middle but have a heavier upper tail than a normal distribution.
 
 Because of the collinearity, OLS gives unstable or undefined coefficients, so we try lasso and ridge regression, which handle correlated predictors by penalizing the coefficients. They do not fix the non-normal residuals, which we return to below.
 
@@ -315,7 +317,7 @@ ridge_metrics <- test_metrics(ridge_pred)
 ridge_metrics
 ```
 
-Ridge uses $\lambda =$ `r signif(ridge_fit$lambda[best], 3)`, chosen by generalized cross-validation. It shrinks all `r length(ridge_coefs) - 1` coefficients toward zero but keeps every predictor. Its test RMSE is `r round(ridge_metrics$rmse, 3)` and its test $R^2$ is `r round(ridge_metrics$r2, 3)`, slightly worse than the lasso (`r round(lasso_metrics$r2, 3)`). Interestingly, the lasso's smaller model slightly increases predictive accuracy. Ridge is often better when predictors are highly correlated, but here the lasso's variable selection seems to help.
+Ridge uses $\lambda =$ `r signif(ridge_fit$lambda[best], 3)`, chosen by generalized cross-validation. It shrinks all `r length(ridge_coefs) - 1` coefficients toward zero but keeps every predictor. Its test RMSE is `r round(ridge_metrics$rmse, 3)` and its test $R^2$ is `r round(ridge_metrics$r2, 3)`, slightly better than the lasso (`r round(lasso_metrics$r2, 3)`). Ridge often does better when predictors are highly correlated, as they are here, but the difference is small: the lasso reaches almost the same accuracy with `r nrow(lasso_coefs)` instead of `r length(ridge_coefs) - 1` predictor columns.
 
 However, both lasso and ridge do not explain enough of the variance in the test set, so it makes sense to try a model that accounts for more complex, nonlinear relationships within the data.
 
@@ -391,7 +393,7 @@ qqline(lasso_resid, col = "blue3")
 
 The best model based on the test set is the `r tolower(model_results$model[1])`, with an RMSE of `r round(model_results$rmse[1], 3)` and an $R^2$ of `r round(model_results$r2[1], 3)`. The gap between the best and worst model is `r round(max(model_results$r2) - min(model_results$r2), 3)` in $R^2$. Importantly, we note that we cannot choose a model based on comparison of the performance of the test data. The test set only offers an estimate of how the model will perform on unseen data, but it cannot be used for selecting a model without making that estimate optimistic. We will add a separate validation step to choose a model.
 
-**Assumptions.** Lasso and ridge are linear models, so they assume the price is linear in the predictors, and their residuals should look like the OLS residuals did. Penalization fixes the collinearity problem by giving stable estimates where OLS returned NA. It does not fix non-normal or non-constant errors. Because we judge these models by cross-validation and test error, not by p-values, non-normal residuals matter less here than they did for OLS. The lasso's test residuals have a standard deviation of `r round(sd(lasso_resid), 3)`, and `r round(100 * mean(abs(lasso_resid) > 2 * sd(lasso_resid)), 1)`% of them are more than two standard deviations from zero, while 5% would be expected under normality. The random forest makes no linearity or normality assumption, so we can justify the model more easily. Its higher test $R^2$ suggests that some of the relationships are nonlinear or involve interactions the linear models does not include.
+**Assumptions.** Lasso and ridge are linear models, so they assume the price is linear in the predictors, and their residuals should look like the OLS residuals did. Penalization fixes the collinearity problem by giving stable estimates where OLS returned NA. It does not fix non-normal or non-constant errors. Because we judge these models by cross-validation and test error, not by p-values, non-normal residuals matter less here than they did for OLS. The lasso's test residuals have a standard deviation of `r round(sd(lasso_resid), 3)`, and `r round(100 * mean(abs(lasso_resid) > 2 * sd(lasso_resid)), 1)`% of them are more than two standard deviations from zero, while about 4.6% would be expected under normality. The random forest makes no linearity or normality assumption, so we can justify the model more easily. Its higher test $R^2$ suggests that some of the relationships are nonlinear or involve interactions the linear models does not include.
 
 The linear models assume that observations are independent. They aren't fully independent because the same artist appears many times and the random split may put the same artists in both the training and test sets. The test errors above are therefore likely somewhat optimistic for predicting prices of new artists.
 
