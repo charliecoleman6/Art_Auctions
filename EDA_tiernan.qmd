@@ -1,0 +1,401 @@
+---
+title: "Data Cleaning + EDA"
+format: pdf
+---
+
+
+# Data Cleaning and Exploratory Data Analysis
+This dataset has been filtered to only include auctions from 2006 and later. The dataset includes information on auction prices, dates, and other relevant features. We also have a separate dataset containing transaction information, which we will join with the auction data for further analysis.
+
+```{r}
+library(dplyr)
+library(readr)
+auctions <- read.csv("df_for_ml_improved_up_to_2012.csv")
+#transactions <- read.csv("transactions.csv") #charlie path
+transactions <- read.csv("/Users/tiernancolby/Downloads/transactions.csv") # Tiernan path
+
+auctions <- auctions |>
+    left_join(transactions, by = "case_id") |>
+    filter(year >=2006)
+
+write_csv(auctions, "joined_auctions_transactions.csv")
+```
+
+
+The complete dataset, composed of two joined tables, contains `r format(nrow(auctions), big.mark = ",")` observations and `r ncol(auctions)` variables before cleaning.
+
+```{r}
+#| label: clean-auctions
+#| message: false
+
+library(tidyverse)
+
+MAX_SIDE_IN <- 300  # a side longer than this treated as a data error
+
+raw <- read_csv("joined_auctions_transactions.csv",
+                locale = locale(encoding = "latin1"),  # file is not UTF-8
+                name_repair = "minimal",               # keep names like Tier...1
+                guess_max = 30000, show_col_types = FALSE,
+                col_types = cols(Year.of.Birth = col_character()))
+
+unescape_html <- function(x) {
+  str_replace_all(x, c("&#0?39;" = "'", "&#0?34;" = "\"", "&quot;" = "\"",
+                       "&lt;" = "<", "&gt;" = ">", "&amp;" = "&")) |>
+    str_squish()
+}
+
+from_dummies <- function(cols, labels = cols) {
+  m <- as.matrix(raw[cols])
+  m[is.na(m)] <- 0
+  stopifnot(all(rowSums(m) <= 1))
+  factor(if_else(rowSums(m) == 0, "unknown", labels[max.col(m, ties.method = "first")]))
+}
+
+from_prefix <- function(prefix) {
+  cols <- names(raw)[startsWith(names(raw), prefix)]
+  labels <- str_remove(cols, fixed(prefix)) |>
+    str_replace_all(fixed("."), " ") |>
+    recode(Dutch = "Netherlands", Swiss = "Switzerland", Italia = "Italy")
+  from_dummies(cols, labels)
+}
+
+genre_labels <- c("Painting", "Photograph", "Drawing", "Print", "Sculpture", "Other")
+untitled_rx  <- regex("untitled|sans titre|senza titolo|ohne titel", ignore_case = TRUE)
+multi_rx <- regex("[\\[(]\\s*\\w+ works[\\])]", ignore_case = TRUE)
+
+auctions_clean <- raw |>
+  mutate(
+    across(c(artist_name, auction_house, nationality), unescape_html),
+    house_tier = from_prefix("Tier..."),
+    sale_country = from_prefix("Country..."),
+    sale_continent = from_prefix("Continent..."),
+    artist_country = from_prefix("Living..."),
+    artist_gender = from_dummies(c("gender_female", "gender_male", "gender_NA"),
+                                         c("female", "male", "unknown")),
+    artist_education = from_dummies(c("edu_domestic", "edu_abroad", "edu_both", "edu_NA"),
+                                         c("domestic", "abroad", "both", "unknown")),
+    artist_degree = from_dummies(c("no_degree", "undergrad", "grad", "degree_NA"),
+                                         c("none", "undergraduate", "graduate", "unknown")),
+    artist_elite_school = from_dummies(c("elite_school", "non_elite_school", "elite_school_NA"),
+                                         c("elite", "non_elite", "unknown")),
+    artist_elite_award = from_dummies(c("elite_award_received", "elite_award_not_received"),
+                                         c("received", "not_received")),
+
+    sale_date = ymd(eventdate),
+    sale_month = month(sale_date),
+    is_hammer = as.integer(Ham_Prem == "Hammer"),
+
+    log_price = log(price_usd.x),
+    log_price_real = log(real_price_usd),
+    log_estimate_mid = log(estimate_center_usd),
+
+    # artwork: implausible sizes -> NA
+    bad_size = replace_na(height.x > MAX_SIDE_IN | width.x > MAX_SIDE_IN, FALSE),
+    across(c(height.x, width.x, size_inchsqr), \(v) replace(v, bad_size, NA)),
+    log_area = log(size_inchsqr),
+    aspect_ratio = height.x / width.x,
+    work_age = if_else(year - year_of_artwork >= 0, year - year_of_artwork, NA),
+    genre = factor(genre_labels[genre], levels = genre_labels),
+    materials = factor(materials),
+    is_untitled = as.integer(str_detect(replace_na(lot_title, ""), untitled_rx)),
+    is_multiple_works = as.integer(str_detect(replace_na(lot_title, ""), multi_rx)),
+    has_provenance = as.integer(!is.na(provenance)),
+
+    birth_year = as.integer(str_extract(Year.of.Birth, "\\d{4}")),
+    bad_age = str_detect(replace_na(Year.of.Birth, ""), fixed("d.")) |
+                 replace_na(abs(year - birth_year - age) > 1, FALSE),
+    artist_age = replace(age, bad_age, NA),
+    artist_has_bio = as.integer(biography == "Y")
+  ) |>
+  select(
+    row_id = case_id, is_train = train,
+    sale_date, sale_year = year, sale_month, auction_house, house_tier,
+    sale_country, sale_continent, is_hammer,
+    price_usd = price_usd.x, price_real_usd = real_price_usd, log_price, log_price_real,
+    estimate_low_usd = estimate_min_usd, estimate_high_usd = estimate_max_usd, log_estimate_mid,
+    genre, materials, height_in = height.x, width_in = width.x, area_sq_in = size_inchsqr,
+    log_area, aspect_ratio, year_made = year_of_artwork, work_age,
+    is_untitled, is_multiple_works, has_provenance,
+    in_main_genre = matched_genre, sold_in_home_country = matched_country,
+    artist = artist_name, artist_nationality = nationality, artist_country, artist_age,
+    artist_gender, artist_education, artist_degree, artist_elite_school,
+    artist_elite_award, artist_has_bio,
+    artist_rank = ranking, solo_shows = solo_show, group_shows = group_show,
+    biennials = fest_biennal, private_collection_buys = private_inst,
+    museum_buys = public_inst,
+    artist_sale_number = artwork_order,
+    mean_price_last5_usd  = price_usd_prev_5_mean,  median_price_last5_usd  = price_usd_prev_5_median,
+    mean_price_last10_usd = price_usd_prev_10_mean, median_price_last10_usd = price_usd_prev_10_median
+  ) |>
+  arrange(sale_date, row_id)
+```
+
+The final cleaned dataset contains `r format(nrow(auctions_clean), big.mark = ",")` observations and `r ncol(auctions_clean)` variables.
+
+## Data dictionary: `auctions_clean`
+
+Each row is one auction sale of a work by a living contemporary artist, 2006–2012. Binary columns are coded as 0/1, and money is in USD.
+
+**Leave out of the predictors:** all four price columns, because they are the outcome. The source's same-year price averages are dropped because they contain the sale's own price.
+
+| Column | Meaning |
+|---|---|
+| `row_id` | Unique row ID |
+| `is_train` | Authors' time-based split: 1 = train (2006–2011), 0 = test (2011–2012) |
+| `sale_date`, `sale_year`, `sale_month` | When the auction took place |
+| `auction_house` | Auction house name |
+| `house_tier` | House prestige tier, 1 (Christie's, Sotheby's, Phillips) to 4 |
+| `sale_country`, `sale_continent` | Where the sale took place (smaller countries grouped as "Others") |
+| `is_hammer` | 1 = the recorded price excludes the buyer's premium |
+| `price_usd`, `log_price` | Sale price, nominal |
+| `price_real_usd`, `log_price_real` | Sale price, adjusted for inflation |
+| `estimate_low_usd`, `estimate_high_usd` | Auction house's pre-sale estimate range |
+| `log_estimate_mid` | Log of the estimate midpoint. Known before the sale but very close to the price, so compare models with and without it |
+| `genre` | Painting, Photograph, Drawing, Print, Sculpture or Other (labels inferred from undocumented codes) |
+| `materials` | Materials code 1–17 (no key published) |
+| `height_in`, `width_in`, `area_sq_in`, `log_area`, `aspect_ratio` | Size in inches. NA where a side was over 300 in (likely a unit error) |
+| `year_made`, `work_age` | Year the work was made, and its age at sale |
+| `is_untitled` | 1 = titled "Untitled" (or the French, Italian or German equivalent) |
+| `is_multiple_works` | 1 = the lot is a set of works |
+| `has_provenance` | 1 = the lot listed a provenance |
+| `in_main_genre` | 1 = the work is in the artist's main genre |
+| `sold_in_home_country` | 1 = sold in the country where the artist works |
+| `artist` | Artist name. Use as a grouping variable or random effect |
+| `artist_nationality`, `artist_country` | Nationality, and the country the artist lives in |
+| `artist_age` | Age at sale. NA where the birth record was inconsistent |
+| `artist_gender` | female / male / unknown |
+| `artist_education` | Where they studied: domestic / abroad / both / unknown |
+| `artist_degree` | none / undergraduate / graduate / unknown |
+| `artist_elite_school`, `artist_elite_award` | Attended an elite art school; won an elite award |
+| `artist_has_bio` | 1 = a biography was available |
+| `artist_rank` | Global artist ranking at time of sale (lower = more prominent) |
+| `solo_shows`, `group_shows`, `biennials` | Exhibition counts up to the sale year |
+| `private_collection_buys`, `museum_buys` | Number of acquisitions by private collections and by museums |
+| `artist_sale_number` | Position of this sale in the artist's auction history |
+| `mean_price_last5_usd`, `median_price_last5_usd` | Mean and median price of the artist's previous 5 sales |
+| `mean_price_last10_usd`, `median_price_last10_usd` | Same, for the previous 10 sales |
+
+# Initial model fitting
+
+Here we do pre variable selection. We collapse factors with many rare levels, and drop rows with missing values. We remove variables that are neither predictors nor response (such as ID variables), or do not offer insight to our research question such as expert estimates of the price.
+
+```{r}
+# remove variables that are not predictors or response
+model_df <- auctions_clean |>
+  dplyr::select(
+    -c(log_price, price_real_usd, log_price_real),  # other transformations of the response
+    -c(estimate_low_usd, estimate_high_usd, log_estimate_mid), # experts' estimates of the response, would
+    -c(row_id, sale_date, artist), # ids / not predictors
+    -auction_house # too many levels and house_tier contains the relevant signal from this predictor
+  ) |>
+  mutate(
+    # reduce the number of categories by combining rare ones into a single level
+    artist_nationality = fct_lump_n(artist_nationality, 10),
+    artist_country = fct_lump_n(artist_country, 10),
+    materials = fct_lump_prop(materials, 0.01),
+    genre = fct_collapse(genre, Other = c("Other", "Sculpture"))
+  ) |>
+  drop_na() |>
+  droplevels()
+```
+
+There are no predictors that we filter out because they have a large proportion of NA values, and there are no rows we filter out because they have a large proportion of NA predictor values.
+
+Building the OLS model
+```{r}
+ols <- lm(price_usd ~ . - is_train, data = model_df)
+summary(ols)
+```
+
+
+```{r}
+#transform y
+bc <- MASS::boxcox(ols, lambda = seq(-0.5, 1, 0.01))
+lambda <- bc$x[which.max(bc$y)]
+lambda_ci <- range(bc$x[bc$y > max(bc$y) - qchisq(0.95, 1) / 2])
+lambda
+
+# we replace the raw response with the transformed one
+model_df <- model_df |>
+  mutate(price_trans = price_usd^lambda) |>
+  dplyr::select(-price_usd)
+
+# we refit the ols with transformed response
+ols_y_trans <- lm(price_trans ~ . - is_train, data = model_df)
+summary(ols_y_trans)
+```
+
+
+From the Box-Cox transformation we use $\lambda =$ `r round(lambda, 3)`, which maximizes the profile log-likelihood. Its 95% confidence interval is [`r round(lambda_ci[1], 3)`, `r round(lambda_ci[2], 3)`], which does not contain $0$ (a log transformation) and does not contain $1$ (no transformation).
+
+The (almost) log transformation of the response increases the multiple $R^2$ of the OLS model from `r round(summary(ols)$r.squared, 3)` to `r round(summary(ols_y_trans)$r.squared, 3)` (on their respective scales), an increase of `r round(summary(ols_y_trans)$r.squared - summary(ols)$r.squared, 3)`.
+
+`r sum(is.na(coef(ols_y_trans)))` of the `r length(coef(ols_y_trans))` coefficients are estimated as NA. This happens when there is perfect collinearity among predictors. There is also strong correlation among related predictors such as the size variables and the artist's previous sale prices.
+
+Thus, we susepect that the model assumptions are not met. We check the model assumptions:
+
+```{r}
+plot(fitted(ols_y_trans), resid(ols_y_trans), xlab = "Fitted", ylab = "Residuals")
+abline(h = 0, col = "blue3")
+
+qqnorm(resid(ols_y_trans))
+qqline(resid(ols_y_trans), col = "blue3")
+```
+
+From the first plot it is hard to tell how much heterogenity we have, but certainly the variance of the first few residuals are a lot lower than the rest. From the second plots we see that the residuals are not normally distributed because they differ a lot from the normal Q-Q plot.
+
+Because of the collinearity, OLS gives unstable or undefined coefficients, so we try lasso and ridge regression, which handle correlated predictors by penalizing the coefficients. They do not fix the non-normal residuals, which we return to below.
+
+```{r}
+library(tidyverse)
+library(glmnet)
+
+x <- model.matrix(price_trans ~ . - is_train, data = model_df)[, -1]
+y <- model_df$price_trans
+
+# 75 / 25 train test split
+set.seed(47)
+train_rows <- sample(nrow(x), size = floor(0.75 * nrow(x)))
+x_train <- x[train_rows, ]
+y_train <- y[train_rows]
+x_test <- x[-train_rows, ]
+y_test <- y[-train_rows]
+
+# Test-set RMSE and R^2
+test_metrics <- function(pred) {
+  tibble(
+    rmse = sqrt(mean((y_test - pred)^2)),
+    r2 = 1 - sum((y_test - pred)^2) / sum((y_test - mean(y_test))^2)
+  )
+}
+```
+
+We split the data at random into `r format(length(y_train), big.mark = ",")` training and `r format(length(y_test), big.mark = ",")` test sales, and assess every model on the same test set.
+
+
+```{r}
+# Lasso (alpha = 1), lambda chosen by 10-fold CV
+set.seed(47)
+lasso_fit <- cv.glmnet(x_train, y_train, alpha = 1)
+plot(lasso_fit)
+c(lambda_min = lasso_fit$lambda.min, lambda_1se = lasso_fit$lambda.1se)
+
+# Variables the lasso kept
+coefs <- coef(lasso_fit, s = "lambda.1se")
+lasso_coefs <- tibble(term = rownames(coefs), estimate = as.numeric(coefs)) |>
+  filter(estimate != 0, term != "(Intercept)") |>
+  arrange(desc(abs(estimate)))
+nrow(lasso_coefs)   # number of predictors kept
+lasso_coefs
+
+lasso_pred <- as.numeric(predict(lasso_fit, newx = x_test, s = "lambda.1se"))
+lasso_metrics <- test_metrics(lasso_pred)
+lasso_metrics
+```
+
+Using $\lambda_{1se} =$ `r signif(lasso_fit$lambda.1se, 3)`, the lasso keeps `r nrow(lasso_coefs)` of the `r ncol(x)` predictor columns and sets the other `r ncol(x) - nrow(lasso_coefs)` to zero. The largest coefficients, in magnitude, belong to `r paste(head(lasso_coefs$term, 3), collapse = ", ")`. On the test set, the lasso has an RMSE of `r round(lasso_metrics$rmse, 3)` on the transformed ($y^\lambda$) scale and a test $R^2$ of `r round(lasso_metrics$r2, 3)`.
+
+
+```{r}
+# Ridge regression
+lambdas <- 10^seq(-3, 4, length.out = 100)
+ridge_fit <- MASS::lm.ridge(y_train ~ x_train, lambda = lambdas)
+
+# we pick the lambda with the lowest GCV
+plot(ridge_fit$lambda, ridge_fit$GCV, log = "x", type = "l",
+     xlab = "lambda", ylab = "GCV")
+best <- which.min(ridge_fit$GCV)
+abline(v = ridge_fit$lambda[best], lty = 2)
+c(lambda_gcv = ridge_fit$lambda[best])
+
+# Predictions
+ridge_coefs <- coef(ridge_fit)[best, ]
+ridge_pred  <- as.numeric(cbind(1, x_test) %*% ridge_coefs)
+ridge_metrics <- test_metrics(ridge_pred)
+ridge_metrics
+```
+
+Ridge uses $\lambda =$ `r signif(ridge_fit$lambda[best], 3)`, chosen by generalized cross-validation. It shrinks all `r length(ridge_coefs) - 1` coefficients toward zero but keeps every predictor. Its test RMSE is `r round(ridge_metrics$rmse, 3)` and its test $R^2$ is `r round(ridge_metrics$r2, 3)`, slightly worse than the lasso (`r round(lasso_metrics$r2, 3)`). Interestingly, the lasso's smaller model slightly increases predictive accuracy. Ridge is often better when predictors are highly correlated, but here the lasso's variable selection seems to help.
+
+However, both lasso and ridge do not explain enough of the variance in the test set, so it makes sense to try a model that accounts for more complex, nonlinear relationships within the data.
+
+
+```{r}
+library(ranger)
+
+train_df <- model_df[train_rows, ] |> dplyr::select(-is_train)
+test_df  <- model_df[-train_rows, ] |> dplyr::select(-is_train)
+p <- ncol(train_df) - 1
+
+# Tuning grid for hyperparamters
+grid <- expand_grid(
+  mtry = c(floor(sqrt(p)), floor(p / 3), floor(p / 2)),
+  min.node.size = c(5, 20)
+)
+
+# Tune by out-of-bag (OOB) error
+set.seed(47)
+
+oob_rmse <- function(mtry, min.node.size) {
+  fit <- ranger(price_trans ~ ., data = train_df, num.trees = 300,
+                mtry = mtry, min.node.size = min.node.size, seed = 1)
+  sqrt(fit$prediction.error)
+}
+
+cv_results <- grid |>
+  mutate(oob_rmse = map2_dbl(mtry, min.node.size, oob_rmse)) |>
+  arrange(oob_rmse)
+cv_results
+best_rf <- slice(cv_results, 1)
+
+# Final forest on the full training set with the best hyperparameters
+rf_fit <- ranger(price_trans ~ ., data = train_df,
+                 num.trees = 500, mtry = best_rf$mtry, min.node.size = best_rf$min.node.size,
+                 importance = "permutation", seed = 1)
+
+rf_pred <- predict(rf_fit, test_df)$predictions
+rf_metrics <- test_metrics(rf_pred)
+rf_metrics
+
+# Top variables by permutation importance
+tibble(variable = names(rf_fit$variable.importance),
+       importance = rf_fit$variable.importance) |>
+  slice_max(importance, n = 15) |>
+  ggplot(aes(importance, fct_reorder(variable, importance))) +
+  geom_col() +
+  labs(x = "Permutation importance (increase in MSE)", y = NULL)
+```
+
+Out-of-bag error picked `mtry` = `r best_rf$mtry` (of `r p` predictors) and a minimum leaf size of `r best_rf$min.node.size`, with an OOB RMSE of `r round(best_rf$oob_rmse, 3)`. On the test set the random forest has an RMSE of `r round(rf_metrics$rmse, 3)` and an $R^2$ of `r round(rf_metrics$r2, 3)`, compared with `r round(lasso_metrics$r2, 3)` for the lasso. The most important variable is `r names(which.max(rf_fit$variable.importance))`, and the top three are `r paste(names(sort(rf_fit$variable.importance, decreasing = TRUE))[1:3], collapse = ", ")`.
+
+## Model comparison and assumptions
+
+```{r}
+model_results <- bind_rows(
+  lasso_metrics |> mutate(model = "Lasso", predictors = nrow(lasso_coefs)),
+  ridge_metrics |> mutate(model = "Ridge", predictors = ncol(x)),
+  rf_metrics    |> mutate(model = "Random forest", predictors = ncol(x))
+) |>
+  dplyr::select(model, predictors, rmse, r2) |>
+  arrange(rmse)
+model_results
+
+# Test set residuals for the linear lasso model
+lasso_resid <- y_test - lasso_pred
+plot(lasso_pred, lasso_resid, xlab = "Fitted (lasso)", ylab = "Residuals")
+abline(h = 0, col = "blue3")
+
+qqnorm(lasso_resid)
+qqline(lasso_resid, col = "blue3")
+```
+
+The best model based on the test set is the `r tolower(model_results$model[1])`, with an RMSE of `r round(model_results$rmse[1], 3)` and an $R^2$ of `r round(model_results$r2[1], 3)`. The gap between the best and worst model is `r round(max(model_results$r2) - min(model_results$r2), 3)` in $R^2$. Importantly, we note that we cannot choose a model based on comparison of the performance of the test data. The test set only offers an estimate of how the model will perform on unseen data, but it cannot be used for selecting a model without making that estimate optimistic. We will add a separate validation step to choose a model.
+
+**Assumptions.** Lasso and ridge are linear models, so they assume the price is linear in the predictors, and their residuals should look like the OLS residuals did. Penalization fixes the collinearity problem by giving stable estimates where OLS returned NA. It does not fix non-normal or non-constant errors. Because we judge these models by cross-validation and test error, not by p-values, non-normal residuals matter less here than they did for OLS. The lasso's test residuals have a standard deviation of `r round(sd(lasso_resid), 3)`, and `r round(100 * mean(abs(lasso_resid) > 2 * sd(lasso_resid)), 1)`% of them are more than two standard deviations from zero, while 5% would be expected under normality. The random forest makes no linearity or normality assumption, so we can justify the model more easily. Its higher test $R^2$ suggests that some of the relationships are nonlinear or involve interactions the linear models does not include.
+
+The linear models assume that observations are independent. They aren't fully independent because the same artist appears many times and the random split may put the same artists in both the training and test sets. The test errors above are therefore likely somewhat optimistic for predicting prices of new artists.
+
+
+# Obstacles and limitations
+
+Because the dataset is large, both in number of observations and in number of predictors, we have to be careful about overfitting. The lasso and ridge help with this by penalizing large coefficients, but they still assume linearity. The random forest can capture nonlinear relationships, and protects against overfitting, but it is more difficult to interpret. With such a large dataset, it makes sense to prioritize predictive accuracy over interpretability. However, we will also try to understand the most important predictors and their effects on price to help answer our research question. Modeling such a complex dataset using linear methods is a challenge, and it is difficult to confirm whether or not the assumptions of the models are met.
